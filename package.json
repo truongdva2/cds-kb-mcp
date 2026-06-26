@@ -1,15 +1,20 @@
 {
   "name": "cds-kb-mcp",
-  "version": "1.0.0",
-  "description": "Dataless MCP server for the SAP CDS knowledge base (local or remote data source).",
+  "version": "1.2.0",
+  "description": "Dataless MCP server for the SAP CDS knowledge base. Defaults to online mode (no setup needed); local mode available for offline/custom-data scenarios.",
   "type": "module",
   "bin": {
     "cds-kb-mcp": "dist/cds-kb-mcp.mjs"
   },
   "scripts": {
     "build": "node build.mjs",
-    "start": "node src/server.mjs"
+    "start": "node src/server.mjs",
+    "test": "node test_tools.mjs"
   },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["mcp", "sap", "s4hana", "cds", "knowledge-base", "ai-agent", "claude"],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "minisearch": "^7.2.0",

@@ -22944,6 +22944,8 @@ function filterSections(md, requestedSections) {
   return valid.map((s) => parsed[s]).filter(Boolean).join("\n\n");
 }
 var CACHE_TTL_MS = (parseInt(process.env.CDS_KB_CACHE_TTL_HOURS, 10) || 24) * 60 * 60 * 1e3;
+var FETCH_TIMEOUT_MS = parseInt(process.env.CDS_KB_FETCH_TIMEOUT_MS, 10) || 2e4;
+var FETCH_RETRIES = Math.max(1, parseInt(process.env.CDS_KB_FETCH_RETRIES, 10) || 3);
 async function isCacheFresh(filePath) {
   try {
     const stat = await fs.stat(filePath);
@@ -22951,6 +22953,24 @@ async function isCacheFresh(filePath) {
   } catch {
     return false;
   }
+}
+async function cacheExists(filePath) {
+  try {
+    await fs.stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function atomicWriteFile(filePath, content) {
+  const dir = path.dirname(filePath);
+  await fs.mkdir(dir, { recursive: true });
+  const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  await fs.writeFile(tmp, content, "utf-8");
+  await fs.rename(tmp, filePath);
+}
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 var LocalDataSource = class {
   constructor(rootDir) {
@@ -22990,43 +23010,133 @@ var RemoteDataSource = class {
   constructor(baseUrl, { cacheDir } = {}) {
     this.base = baseUrl.replace(/\/+$/, "");
     const key = crypto.createHash("sha1").update(this.base).digest("hex").slice(0, 12);
-    this.cacheDir = cacheDir || path.join(os.homedir(), ".cache", "cds-kb", key);
+    const cacheRoot = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+    this.cacheDir = cacheDir || path.join(cacheRoot, "cds-kb", key);
+    this.etagFile = path.join(this.cacheDir, "etags.json");
+    this._etags = null;
+    this._inflightRevalidate = /* @__PURE__ */ new Map();
   }
   describe() {
     return `remote:${this.base} (cache ${this.cacheDir})`;
   }
-  async #fetchText(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
-    return res.text();
+  async #loadEtags() {
+    if (this._etags) return this._etags;
+    try {
+      this._etags = JSON.parse(await fs.readFile(this.etagFile, "utf-8"));
+    } catch {
+      this._etags = {};
+    }
+    return this._etags;
+  }
+  async #saveEtag(url, etag) {
+    const map = await this.#loadEtags();
+    if (!etag) return;
+    map[url] = etag;
+    try {
+      await atomicWriteFile(this.etagFile, JSON.stringify(map));
+    } catch {
+    }
+  }
+  // Fetch with timeout, retry (exponential backoff), and conditional GET via ETag.
+  // Returns { text, status } where status ∈ {200, 304, ...}; throws on terminal failure.
+  async #fetchText(url, { conditional = false, retries = FETCH_RETRIES } = {}) {
+    const etags = conditional ? await this.#loadEtags() : null;
+    const prevEtag = conditional ? etags?.[url] : void 0;
+    let lastErr;
+    for (let attempt = 0; attempt < retries; attempt++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+      try {
+        const headers = {};
+        if (prevEtag) headers["If-None-Match"] = prevEtag;
+        const res = await fetch(url, { signal: ctrl.signal, headers });
+        clearTimeout(timer);
+        if (res.status === 304) return { text: null, status: 304, etag: prevEtag };
+        if (res.ok) {
+          const text = await res.text();
+          const etag = res.headers.get("etag") || void 0;
+          if (conditional && etag) await this.#saveEtag(url, etag);
+          return { text, status: res.status, etag };
+        }
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+          throw new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+        }
+        lastErr = new Error(`GET ${url} -> ${res.status} ${res.statusText}`);
+      } catch (e) {
+        clearTimeout(timer);
+        lastErr = e;
+      }
+      if (attempt < retries - 1) {
+        const backoff = Math.min(500 * 2 ** attempt, 5e3);
+        await sleep(backoff);
+      }
+    }
+    throw lastErr || new Error(`GET ${url} failed after ${retries} attempts`);
+  }
+  // Validate that text is parseable JSON before persisting cache.
+  async #persistJsonCache(cacheFile, text) {
+    JSON.parse(text);
+    await atomicWriteFile(cacheFile, text);
+  }
+  // Background revalidation — silently refresh stale cache without blocking the caller.
+  #revalidateInBackground(url, cacheFile, { json = false } = {}) {
+    if (this._inflightRevalidate.has(url)) return;
+    const task = (async () => {
+      try {
+        const { text, status } = await this.#fetchText(url, { conditional: true });
+        if (status === 304) {
+          try {
+            const now = /* @__PURE__ */ new Date();
+            await fs.utimes(cacheFile, now, now);
+          } catch {
+          }
+          return;
+        }
+        if (json) await this.#persistJsonCache(cacheFile, text);
+        else await atomicWriteFile(cacheFile, text);
+      } catch (e) {
+        console.error(`[cds-kb-mcp] background revalidate failed for ${url}: ${e.message}`);
+      } finally {
+        this._inflightRevalidate.delete(url);
+      }
+    })();
+    this._inflightRevalidate.set(url, task);
   }
   async loadIndexWrapper() {
     const cacheFile = path.join(this.cacheDir, "search_index.json");
-    if (process.env.CDS_KB_REFRESH !== "1") {
+    const url = `${this.base}/index/search_index.json`;
+    const forceRefresh = process.env.CDS_KB_REFRESH === "1";
+    if (!forceRefresh && await cacheExists(cacheFile)) {
+      const fresh = await isCacheFresh(cacheFile);
       try {
-        if (await isCacheFresh(cacheFile)) {
-          return JSON.parse(await fs.readFile(cacheFile, "utf-8"));
+        const parsed = JSON.parse(await fs.readFile(cacheFile, "utf-8"));
+        if (!fresh) {
+          console.error("[cds-kb-mcp] index cache stale, serving from cache + revalidating in background");
+          this.#revalidateInBackground(url, cacheFile, { json: true });
         }
-        console.error("[cds-kb-mcp] index cache expired, re-downloading...");
+        return parsed;
       } catch {
+        console.error("[cds-kb-mcp] index cache corrupt, re-downloading...");
       }
     }
-    const text = await this.#fetchText(`${this.base}/index/search_index.json`);
-    await fs.mkdir(this.cacheDir, { recursive: true });
-    await fs.writeFile(cacheFile, text, "utf-8");
+    const { text } = await this.#fetchText(url, { conditional: true });
+    await this.#persistJsonCache(cacheFile, text);
     return JSON.parse(text);
   }
   async getView(name) {
     const safe = path.basename(name).replace(/\.md$/i, "").toUpperCase();
     const cacheFile = path.join(this.cacheDir, "views", `${safe}.md`);
-    try {
-      return await fs.readFile(cacheFile, "utf-8");
-    } catch {
+    const url = `${this.base}/views/${safe}.md`;
+    if (await cacheExists(cacheFile)) {
+      const md = await fs.readFile(cacheFile, "utf-8");
+      if (!await isCacheFresh(cacheFile)) {
+        this.#revalidateInBackground(url, cacheFile);
+      }
+      return md;
     }
-    const md = await this.#fetchText(`${this.base}/views/${safe}.md`);
-    await fs.mkdir(path.dirname(cacheFile), { recursive: true });
-    await fs.writeFile(cacheFile, md, "utf-8");
-    return md;
+    const { text } = await this.#fetchText(url, { conditional: true });
+    await atomicWriteFile(cacheFile, text);
+    return text;
   }
   async getViewSections(name, sections) {
     const md = await this.getView(name);
@@ -23034,17 +23144,20 @@ var RemoteDataSource = class {
   }
   async getTaxonomy() {
     const cacheFile = path.join(this.cacheDir, "taxonomy.json");
-    if (process.env.CDS_KB_REFRESH !== "1") {
+    const url = `${this.base}/index/taxonomy.json`;
+    const forceRefresh = process.env.CDS_KB_REFRESH === "1";
+    if (!forceRefresh && await cacheExists(cacheFile)) {
+      const fresh = await isCacheFresh(cacheFile);
       try {
-        if (await isCacheFresh(cacheFile)) {
-          return JSON.parse(await fs.readFile(cacheFile, "utf-8"));
-        }
+        const parsed = JSON.parse(await fs.readFile(cacheFile, "utf-8"));
+        if (!fresh) this.#revalidateInBackground(url, cacheFile, { json: true });
+        return parsed;
       } catch {
       }
     }
     try {
-      const text = await this.#fetchText(`${this.base}/index/taxonomy.json`);
-      await fs.writeFile(cacheFile, text, "utf-8");
+      const { text } = await this.#fetchText(url, { conditional: true });
+      await this.#persistJsonCache(cacheFile, text);
       return JSON.parse(text);
     } catch {
       return null;
@@ -23132,7 +23245,6 @@ async function loadIndex() {
   }
   mini = MiniSearch.loadJSON(w.minisearch, w.options);
   meta = { viewCount: w.viewCount, enrichedCount: w.enrichedCount, builtAt: w.builtAt };
-  const allDocs = mini.search("", { prefix: false, fuzzy: false });
   const ms = JSON.parse(w.minisearch);
   const stored = ms.storedFields || {};
   const stats = {};
@@ -23148,7 +23260,7 @@ async function loadIndex() {
   moduleStats = stats;
   taxonomyData = await ds.getTaxonomy();
 }
-var server = new McpServer({ name: "cds-knowledge-base", version: "1.1.0" });
+var server = new McpServer({ name: "cds-knowledge-base", version: "1.2.0" });
 server.registerTool(
   "search_cds",
   {
@@ -23200,11 +23312,10 @@ server.registerTool(
     try {
       const text = sections && sections.length > 0 ? await ds.getViewSections(name, sections) : await ds.getView(name);
       return { content: [{ type: "text", text }] };
-    } catch {
-      return {
-        content: [{ type: "text", text: `View "${name}" not found. Use search_cds first to get the exact name.` }],
-        isError: true
-      };
+    } catch (e) {
+      const notFound = e?.code === "ENOENT" || /404/.test(e?.message || "");
+      const msg = notFound ? `View "${name}" not found. Use search_cds first to get the exact name.` : `Failed to fetch view "${name}": ${e?.message || "unknown error"}. The data source may be temporarily unreachable.`;
+      return { content: [{ type: "text", text: msg }], isError: true };
     }
   }
 );

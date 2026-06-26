@@ -66,10 +66,7 @@ async function loadIndex() {
   mini = MiniSearch.loadJSON(w.minisearch, w.options);
   meta = { viewCount: w.viewCount, enrichedCount: w.enrichedCount, builtAt: w.builtAt };
 
-  // Build module stats from stored fields for the list_modules tool.
-  const allDocs = mini.search('', { prefix: false, fuzzy: false });
-  // MiniSearch doesn't expose all docs directly, so we iterate documentIds.
-  // Instead, use a wildcard-like approach: collect from stored fields.
+  // Build module stats by iterating stored fields directly (MiniSearch has no public allDocs API).
   const ms = JSON.parse(w.minisearch);
   const stored = ms.storedFields || {};
   const stats = {};
@@ -89,7 +86,7 @@ async function loadIndex() {
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
-const server = new McpServer({ name: 'cds-knowledge-base', version: '1.1.0' });
+const server = new McpServer({ name: 'cds-knowledge-base', version: '1.2.0' });
 
 // ── Tool 1: search_cds ─────────────────────────────────────────────────────
 server.registerTool(
@@ -154,11 +151,13 @@ server.registerTool(
         ? await ds.getViewSections(name, sections)
         : await ds.getView(name);
       return { content: [{ type: 'text', text }] };
-    } catch {
-      return {
-        content: [{ type: 'text', text: `View "${name}" not found. Use search_cds first to get the exact name.` }],
-        isError: true,
-      };
+    } catch (e) {
+      // Distinguish "view does not exist" from transport/cache failure so callers know whether to retry.
+      const notFound = e?.code === 'ENOENT' || /404/.test(e?.message || '');
+      const msg = notFound
+        ? `View "${name}" not found. Use search_cds first to get the exact name.`
+        : `Failed to fetch view "${name}": ${e?.message || 'unknown error'}. The data source may be temporarily unreachable.`;
+      return { content: [{ type: 'text', text: msg }], isError: true };
     }
   },
 );
