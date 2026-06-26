@@ -65,8 +65,11 @@ function filterSections(md, requestedSections) {
   return valid.map((s) => parsed[s]).filter(Boolean).join('\n\n');
 }
 
-// ── Cache TTL (24 hours default, configurable via CDS_KB_CACHE_TTL_HOURS) ──
-const CACHE_TTL_MS = (parseInt(process.env.CDS_KB_CACHE_TTL_HOURS, 10) || 24) * 60 * 60 * 1000;
+// ── Cache TTL ──────────────────────────────────────────────────────────────
+// Default 1 hour — short enough that a long-running session picks up upstream
+// updates without restart. The version.json check at startup short-circuits
+// this anyway: if upstream commit matches, cache is reused regardless of age.
+const CACHE_TTL_MS = (parseFloat(process.env.CDS_KB_CACHE_TTL_HOURS) || 1) * 60 * 60 * 1000;
 
 // ── Fetch tunables ─────────────────────────────────────────────────────────
 // Per-request timeout and retry policy for the remote backend.
@@ -125,6 +128,14 @@ export class LocalDataSource {
   }
   async getTaxonomy() {
     const file = path.join(this.root, 'index', 'taxonomy.json');
+    try {
+      return JSON.parse(await fs.readFile(file, 'utf-8'));
+    } catch {
+      return null;
+    }
+  }
+  async getVersion() {
+    const file = path.join(this.root, 'index', 'version.json');
     try {
       return JSON.parse(await fs.readFile(file, 'utf-8'));
     } catch {
@@ -230,29 +241,77 @@ export class RemoteDataSource {
     this._inflightRevalidate.set(url, task);
   }
 
+  // Fetch upstream version manifest (tiny ~200 B file). Used to short-circuit
+  // TTL: if upstream commit equals what we cached on the previous run, the
+  // index is provably current and we can skip the 800 KB index fetch.
+  async getVersion() {
+    const url = `${this.base}/index/version.json`;
+    try {
+      const { text } = await this.#fetchText(url, { conditional: false });
+      return JSON.parse(text);
+    } catch {
+      return null;  // older data repo without version.json → fall back to TTL
+    }
+  }
+
+  async #readCachedVersion() {
+    const file = path.join(this.cacheDir, 'version.json');
+    try { return JSON.parse(await fs.readFile(file, 'utf-8')); } catch { return null; }
+  }
+
+  async #writeCachedVersion(v) {
+    if (!v) return;
+    try { await atomicWriteFile(path.join(this.cacheDir, 'version.json'), JSON.stringify(v)); } catch {}
+  }
+
   async loadIndexWrapper() {
     const cacheFile = path.join(this.cacheDir, 'search_index.json');
     const url = `${this.base}/index/search_index.json`;
     const forceRefresh = process.env.CDS_KB_REFRESH === '1';
 
-    if (!forceRefresh && await cacheExists(cacheFile)) {
-      const fresh = await isCacheFresh(cacheFile);
-      try {
-        const parsed = JSON.parse(await fs.readFile(cacheFile, 'utf-8'));
-        if (!fresh) {
-          // Stale-while-revalidate: serve cache now, refresh in background.
-          console.error('[cds-kb-mcp] index cache stale, serving from cache + revalidating in background');
-          this.#revalidateInBackground(url, cacheFile, { json: true });
+    // ── Step 1: version manifest probe (~200 B, no TTL). Short-circuits everything ──
+    let upstreamVersion = null;
+    let cachedVersion = null;
+    if (!forceRefresh) {
+      upstreamVersion = await this.getVersion();
+      cachedVersion = await this.#readCachedVersion();
+    }
+
+    const cacheHasIndex = await cacheExists(cacheFile);
+    const versionsMatch = !!(upstreamVersion && cachedVersion
+      && upstreamVersion.commit === cachedVersion.commit
+      && upstreamVersion.schemaVersion === cachedVersion.schemaVersion);
+
+    // ── Step 2: cache path — use cache if version matches OR if version probe failed and TTL is fresh ──
+    if (!forceRefresh && cacheHasIndex) {
+      if (versionsMatch) {
+        try {
+          return JSON.parse(await fs.readFile(cacheFile, 'utf-8'));
+        } catch {
+          console.error('[cds-kb-mcp] index cache corrupt despite version match, re-downloading...');
         }
-        return parsed;
-      } catch {
-        // Cache file is corrupt — fall through to a clean re-download.
-        console.error('[cds-kb-mcp] index cache corrupt, re-downloading...');
+      } else if (!upstreamVersion) {
+        // Upstream has no version.json or probe failed → legacy TTL behaviour
+        const fresh = await isCacheFresh(cacheFile);
+        try {
+          const parsed = JSON.parse(await fs.readFile(cacheFile, 'utf-8'));
+          if (!fresh) {
+            console.error('[cds-kb-mcp] index cache stale, serving from cache + revalidating in background');
+            this.#revalidateInBackground(url, cacheFile, { json: true });
+          }
+          return parsed;
+        } catch {
+          console.error('[cds-kb-mcp] index cache corrupt, re-downloading...');
+        }
+      } else {
+        console.error(`[cds-kb-mcp] upstream commit ${upstreamVersion.commit.slice(0,8)} ≠ cached ${(cachedVersion?.commit || 'none').slice(0,8)} — refreshing index`);
       }
     }
 
+    // ── Step 3: full download ─────────────────────────────────────────────
     const { text } = await this.#fetchText(url, { conditional: true });
     await this.#persistJsonCache(cacheFile, text);
+    if (upstreamVersion) await this.#writeCachedVersion(upstreamVersion);
     return JSON.parse(text);
   }
 

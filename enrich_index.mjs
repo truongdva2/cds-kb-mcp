@@ -9,6 +9,7 @@
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 
 const dataRoot = process.argv[2];
 if (!dataRoot) {
@@ -182,3 +183,31 @@ console.log(`\nDone! Wrote enriched index: ${indexFile} (${sizeKB} KB)`);
 console.log(`  viewCount: ${docs.length}`);
 console.log(`  enrichedCount: ${enriched}`);
 console.log(`  Backup: ${backupFile}`);
+
+// ── Write version manifest ────────────────────────────────────────────────
+// Small file (~200 B) that MCP clients fetch on every startup — bypasses TTL.
+// If `commit` differs from what the client cached last, it knows to invalidate.
+//
+// Sources for `commit`:
+//   1. $GITHUB_SHA (set by GitHub Actions)
+//   2. `git -C <dataRoot> rev-parse HEAD` (when run locally in a checkout)
+//   3. fallback to the builtAt timestamp string (still monotonic, still works)
+function resolveCommit() {
+  if (process.env.GITHUB_SHA) return process.env.GITHUB_SHA;
+  try {
+    return execSync(`git -C "${dataRoot}" rev-parse HEAD`, { encoding: 'utf-8' }).trim();
+  } catch {
+    return `builtAt:${output.builtAt}`;
+  }
+}
+
+const versionFile = path.join(dataRoot, 'index', 'version.json');
+const versionManifest = {
+  schemaVersion: output.schemaVersion ?? 1,
+  commit: resolveCommit(),
+  builtAt: output.builtAt,
+  viewCount: output.viewCount,
+  enrichedCount: output.enrichedCount,
+};
+await fs.writeFile(versionFile, JSON.stringify(versionManifest, null, 2) + '\n', 'utf-8');
+console.log(`  version manifest: ${versionFile} (commit=${versionManifest.commit.slice(0, 8)})`);

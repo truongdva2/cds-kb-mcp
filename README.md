@@ -343,7 +343,7 @@ Everything is optional. The defaults are what you want unless you're operating o
 | `CDS_KB_DATA` | — | Path to local data repo (alternative to `--data`) |
 | `CDS_KB_REMOTE` | `https://raw.githubusercontent.com/truongdva2/cds-kb-data/main` | Base URL for online mode |
 | `CDS_KB_REFRESH` | `0` | Set to `1` to bypass cache and force a fresh download |
-| `CDS_KB_CACHE_TTL_HOURS` | `24` | Cache freshness window before revalidation |
+| `CDS_KB_CACHE_TTL_HOURS` | `1` | Legacy TTL — only used when upstream lacks `version.json`. With the version manifest in place, this rarely fires |
 | `CDS_KB_FETCH_TIMEOUT_MS` | `20000` | Per-request HTTP timeout (online mode) |
 | `CDS_KB_FETCH_RETRIES` | `3` | Max attempts on network errors / 5xx / 408 / 429 |
 | `XDG_CACHE_HOME` | `~/.cache` | Honoured for cache directory location |
@@ -356,6 +356,7 @@ Online mode stores everything under `${XDG_CACHE_HOME:-~/.cache}/cds-kb/<sha1-of
 ~/.cache/cds-kb/59f498ee5cf8/
 ├── search_index.json    # 5.7 MB MiniSearch index
 ├── taxonomy.json        # 231 KB business taxonomy
+├── version.json         # ~200 B — {commit, builtAt, viewCount, ...}; checked on every startup
 ├── etags.json           # ETag map for conditional GETs
 └── views/
     ├── I_BUSINESSPARTNER.md
@@ -378,15 +379,30 @@ The remote backend is designed to survive ordinary network conditions:
 
 | Feature | Behaviour | Tunable |
 |---|---|---|
+| **Version manifest probe** | On every startup, fetch `index/version.json` (~200 B). If `commit` matches the cached one, the 5.7 MB index is reused regardless of TTL — guarantees fresh data in seconds after upstream rebuilds | Automatic |
 | **Per-request timeout** | Each HTTP GET aborts after 20 s | `CDS_KB_FETCH_TIMEOUT_MS` |
 | **Retry with exponential backoff** | Up to 3 attempts on network errors and 5xx/408/429 (500 ms → 1 s → 2 s) | `CDS_KB_FETCH_RETRIES` |
 | **Conditional GET via ETag** | Subsequent requests send `If-None-Match`; on 304 just refresh mtime — no re-download | Automatic |
 | **Atomic cache writes** | Writes via `*.tmp` + rename → `kill -9` mid-write cannot corrupt cache | Automatic |
 | **JSON integrity check** | Index and taxonomy parsed before being persisted; corrupt downloads never overwrite a good cache | Automatic |
-| **Stale-while-revalidate** | TTL-expired cache served immediately; refresh happens in background | Automatic |
+| **Stale-while-revalidate** | TTL-expired cache served immediately; refresh happens in background (legacy fallback when upstream lacks `version.json`) | Automatic |
 | **Terminal 4xx fast-fail** | 404 / 403 fail on first attempt — no wasted retries on permanent errors | Automatic |
 
-Net effect: a brief GitHub outage no longer breaks an active session; warm-cache restarts skip the 800 KB index re-download via ETag (304); aggressive `kill` signals can't corrupt cache state.
+Net effect: when the data repo publishes a new commit, the **next** MCP session picks it up automatically — the startup probe sees the commit mismatch and refreshes. A brief GitHub outage can't break an active session; warm-cache restarts skip the 800 KB index re-download.
+
+### How updates propagate
+
+```
+  cds-kb-data push  →  GitHub Action rebuilds index + stamps version.json  →  push back to main
+                                                                                       │
+                                  ▼ (no work needed by users)                          │
+  Next MCP startup:  GET /index/version.json (~200B)                                   │
+                     compare commit vs cached                                          │
+                     mismatch → re-download index (800 KB on the wire)  ◀──────────────┘
+                     match    → reuse cached index, regardless of TTL
+```
+
+End-to-end latency from a data push to clients seeing the new data: **the time of one MCP restart** — typically a few seconds the next time a client opens a new session.
 
 ---
 
@@ -543,7 +559,52 @@ The script exercises all five tools and prints sample output.
 
 ### Updating the search index
 
-The MCP itself never builds the index — that happens in the [`cds-kb-data`](https://github.com/truongdva2/cds-kb-data) repo. When that repo publishes a new index, online-mode clients pick it up automatically on next TTL expiry (or on `CDS_KB_REFRESH=1`).
+The MCP itself never builds the index — `cds-kb-data` does. There are two paths.
+
+#### Automatic (recommended) — let the GitHub Action handle it
+
+The data repo ships a workflow at `.github/workflows/rebuild-on-push.yml`. It triggers on any push that touches `views/**` or `index/taxonomy.json`, runs `enrich_index.mjs` in CI, and commits the regenerated `search_index.json` + `version.json` back to `main`. You only edit views or the taxonomy — the bot keeps the index in sync.
+
+Pipeline diagram:
+
+```
+You: edit views/X.md   →   git push   →   GitHub Action runs:
+                                              ├ checkout cds-kb-data (full history)
+                                              ├ checkout cds-kb-mcp (for enrich_index.mjs)
+                                              ├ npm install minisearch
+                                              ├ node enrich_index.mjs .
+                                              │     (uses $GITHUB_SHA for version.json)
+                                              └ commit + push index/search_index.json
+                                                              index/version.json
+                                                                                ↓
+                                          MCP clients pick up on next startup
+                                          (version probe → commit mismatch → refresh)
+```
+
+Concurrency is guarded — two pushes in quick succession won't race; the second waits for the first to finish.
+
+#### Manual — rebuild locally
+
+Useful when iterating on `enrich_index.mjs` itself, or in air-gapped setups.
+
+```bash
+cd cds-kb-mcp
+node enrich_index.mjs ../cds-kb-data
+cd ../cds-kb-data
+git add index/search_index.json index/version.json
+git commit -m "data: <what changed>"
+git push
+```
+
+#### How clients see updates
+
+On every MCP startup the server fetches `<base>/index/version.json` (~200 B). If the upstream `commit` differs from what was cached on the previous run, the cache is invalidated and the index is re-downloaded. Result: a new data push is visible to every client by the next time they open a session — usually within seconds.
+
+If you ever need to force a refresh in a running session:
+
+```bash
+CDS_KB_REFRESH=1 node dist/cds-kb-mcp.mjs
+```
 
 ---
 

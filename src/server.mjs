@@ -66,6 +66,12 @@ async function loadIndex() {
   mini = MiniSearch.loadJSON(w.minisearch, w.options);
   meta = { viewCount: w.viewCount, enrichedCount: w.enrichedCount, builtAt: w.builtAt };
 
+  // Version manifest is best-effort — older data repos don't ship one.
+  try {
+    const v = await ds.getVersion?.();
+    if (v) meta.commit = v.commit;
+  } catch { /* ignore */ }
+
   // Build module stats by iterating stored fields directly (MiniSearch has no public allDocs API).
   const ms = JSON.parse(w.minisearch);
   const stored = ms.storedFields || {};
@@ -255,10 +261,13 @@ server.registerTool(
     description: 'Report the active data source, view count, enrichment coverage, and index build time.',
     inputSchema: {},
   },
-  async () => ({
-    content: [{ type: 'text', text:
-      `source: ${ds.describe()}\nviews: ${meta.viewCount ?? '?'}\nenriched: ${meta.enrichedCount ?? '?'}\nmodules: ${Object.keys(moduleStats).length}\nbuiltAt: ${meta.builtAt ?? '?'}` }],
-  }),
+  async () => {
+    const commit = meta.commit ? meta.commit.slice(0, 8) : '(no version manifest)';
+    return {
+      content: [{ type: 'text', text:
+        `source: ${ds.describe()}\nviews: ${meta.viewCount ?? '?'}\nenriched: ${meta.enrichedCount ?? '?'}\nmodules: ${Object.keys(moduleStats).length}\nbuiltAt: ${meta.builtAt ?? '?'}\ncommit: ${commit}` }],
+    };
+  },
 );
 
 // ── Main ────────────────────────────────────────────────────────────────────
